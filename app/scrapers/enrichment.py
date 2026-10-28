@@ -15,9 +15,20 @@ from app.scrapers.stealth import random_user_agent, random_delay
 logger = logging.getLogger(__name__)
 
 EMAIL_RE = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-EMAIL_BLACKLIST = ['example.com', 'test.com', 'email.com', 'youremail.com',
+EMAIL_BLACKLIST = ['example.com', 'example.org', 'example.net', 'test.com', 'email.com',
+                   'youremail.com', 'domain.com', 'yourdomain.com', 'company.com',
+                   'yourcompany.com', 'website.com', 'yourwebsite.com', 'mysite.com',
                    'sentry.io', 'wixpress.com', 'googleapis.com', 'w3.org',
                    'schema.org', 'gravatar.com', 'wordpress.com']
+# Placeholder local parts used in form hints ("you@...", "name@...")
+PLACEHOLDER_LOCAL_PARTS = ['you', 'your', 'youremail', 'yourname', 'name', 'username',
+                           'user', 'email', 'someone', 'john.doe', 'jane.doe', 'johndoe',
+                           'janedoe', 'firstname.lastname', 'first.last', 'firstname']
+# Shared mailboxes; their format says nothing about how personal addresses look
+ROLE_LOCAL_PARTS = ['info', 'contact', 'hello', 'hi', 'support', 'help', 'sales', 'press',
+                    'media', 'admin', 'office', 'team', 'careers', 'jobs', 'hr', 'billing',
+                    'marketing', 'partners', 'enquiries', 'inquiries', 'mail', 'noreply',
+                    'no-reply', 'privacy', 'legal', 'security', 'abuse', 'webmaster']
 FILE_EXT_BLACKLIST = ['.png', '.jpg', '.gif', '.css', '.js', '.svg', '.webp', '.ico']
 
 
@@ -154,9 +165,12 @@ class LeadEnricher:
 
     def _is_valid_email(self, email: str) -> bool:
         lower = email.lower()
-        if any(b in lower for b in EMAIL_BLACKLIST):
-            return False
         if any(lower.endswith(ext) for ext in FILE_EXT_BLACKLIST):
+            return False
+        local, _, domain = lower.rpartition('@')
+        if any(domain == b or domain.endswith('.' + b) for b in EMAIL_BLACKLIST):
+            return False
+        if local in PLACEHOLDER_LOCAL_PARTS:
             return False
         return True
 
@@ -258,34 +272,27 @@ class LeadEnricher:
 
         first, last = parts[0], parts[-1]
 
-        domain_emails = [e for e in site_emails if e.lower().endswith('@' + domain)]
-        if not domain_emails:
-            return None
+        locals_on_domain = sorted({
+            e.lower().split('@')[0] for e in site_emails
+            if e.lower().endswith('@' + domain)
+        })
 
-        sample = domain_emails[0].lower()
-        local = sample.split('@')[0]
+        for local in locals_on_domain:
+            if local in ROLE_LOCAL_PARTS:
+                continue
+            pattern = self._detect_pattern(local)
+            if pattern:
+                return self._apply_pattern(pattern, first, last, domain)
 
-        pattern = self._detect_pattern(local)
-        if not pattern:
-            return None
-
-        predicted = self._apply_pattern(pattern, first, last, domain)
-        if predicted and predicted.lower() not in [e.lower() for e in domain_emails]:
-            return predicted
-
-        return predicted
+        return None
 
     def _detect_pattern(self, local_part: str) -> Optional[str]:
-        if '.' in local_part:
-            parts = local_part.split('.')
-            if len(parts) == 2:
-                if len(parts[0]) == 1:
-                    return 'f.last'
-                return 'first.last'
-        if re.match(r'^[a-z][a-z]+$', local_part):
-            return 'first'
-        if re.match(r'^[a-z]\.[a-z]+$', local_part):
+        # Only dotted forms are unambiguous. An undotted local part like
+        # "jsmith" could be first, flast or firstlast, so don't guess.
+        if re.match(r'^[a-z]\.[a-z]{2,}$', local_part):
             return 'f.last'
+        if re.match(r'^[a-z]{2,}\.[a-z]{2,}$', local_part):
+            return 'first.last'
         return None
 
     def _apply_pattern(self, pattern: str, first: str, last: str, domain: str) -> Optional[str]:
@@ -303,7 +310,9 @@ class LeadEnricher:
         if len(parts) != 2 or not parts[1]:
             return {'exists': False, 'accept_all': False, 'score': 0}
         domain = parts[1]
-        result = {'exists': False, 'accept_all': False, 'score': 0}
+        # inconclusive: the server didn't say whether the mailbox exists
+        # (temporary 4xx, policy/sender rejection, or connection failure)
+        result = {'exists': False, 'accept_all': False, 'inconclusive': False, 'score': 0}
 
         try:
             mx_records = dns.resolver.resolve(domain, 'MX')
@@ -316,13 +325,20 @@ class LeadEnricher:
         try:
             with smtplib.SMTP(timeout=10) as smtp:
                 smtp.connect(mx_host, 25)
-                smtp.helo('scout-verify.local')
-                smtp.mail('verify@scout-verify.local')
+                smtp.ehlo_or_helo_if_needed()
+                # Null reverse-path (as used by bounces). A made-up sender domain
+                # gets rejected by strict filters before the recipient is checked.
+                mail_code, _ = smtp.mail('')
+                if mail_code != 250:
+                    result['inconclusive'] = True
+                    return result
                 code, msg = smtp.rcpt(email)
-
                 if code == 250:
                     result['exists'] = True
                     result['score'] += 80
+                elif not self._is_mailbox_rejection(code, msg):
+                    result['inconclusive'] = True
+                    return result
 
                 fake = f'zzznonexistent999@{domain}'
                 code2, _ = smtp.rcpt(fake)
@@ -333,9 +349,21 @@ class LeadEnricher:
         except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError,
                 socket.timeout, ConnectionRefusedError, OSError) as e:
             logger.debug(f"SMTP verify failed for {email}: {e}")
+            result['inconclusive'] = True
             result['score'] += 20
 
         return result
+
+    @staticmethod
+    def _is_mailbox_rejection(code: int, msg: bytes) -> bool:
+        """True only for a permanent 'no such mailbox' answer, not policy/sender/IP blocks."""
+        text = msg.decode('utf-8', 'replace').lower() if isinstance(msg, bytes) else str(msg).lower()
+        if not 500 <= code < 600:
+            return False
+        if 'sender' in text or re.search(r'\b5\.7\.\d+', text) or any(
+                w in text for w in ('blocked', 'spamhaus', 'blacklist', 'blocklist', 'reputation', 'policy')):
+            return False
+        return True
 
     def _score_and_verify_email(self, email: str, source: str,
                                  pattern_match: bool = False,
@@ -371,7 +399,7 @@ class LeadEnricher:
             'email': email,
             'score': min(score, 100),
             'source': source,
-            'verified': smtp_result['exists'],
+            'verified': smtp_result['exists'] and not smtp_result['accept_all'],
             'accept_all': smtp_result['accept_all'],
         }
 
@@ -379,8 +407,10 @@ class LeadEnricher:
         try:
             if not website.startswith('http'):
                 website = 'https://' + website
-            domain = urlparse(website).netloc or website
-            return domain.replace('www.', '')
+            domain = (urlparse(website).hostname or '').lower()
+            if domain.startswith('www.'):
+                domain = domain[4:]
+            return domain or None
         except Exception:
             return None
 
@@ -457,7 +487,8 @@ class LeadEnricher:
 
         parts = full_name.lower().strip().split()
         if len(parts) < 2:
-            return []
+            # Single-word names are usually brands; only shared mailboxes make sense
+            return [f'contact@{domain}', f'info@{domain}']
 
         first, last = parts[0], parts[-1]
         return [

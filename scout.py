@@ -2,6 +2,7 @@
 
 import sys
 import csv
+import io
 import time
 import os
 import logging
@@ -519,6 +520,33 @@ def _standard_scrape_loop(scraper_func, items, label_prefix="@", delay_range=Non
     return profiles
 
 
+def _csv_value(value):
+    """Flatten lists/dicts so CSV cells are readable instead of Python reprs."""
+    if isinstance(value, (list, tuple, set)):
+        return '; '.join(str(v) for v in value)
+    if isinstance(value, dict):
+        return '; '.join(f'{k}: {v}' for k, v in value.items())
+    return value
+
+
+def _write_csv(filename, rows):
+    """Write rows to CSV using every key seen in any row (rows may differ after enrichment)."""
+    fieldnames = []
+    for row in rows:
+        for key in row:
+            if key not in fieldnames:
+                fieldnames.append(key)
+
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({k: _csv_value(v) for k, v in row.items()})
+
+    with open(filename, 'w', newline='', encoding='utf-8') as f:
+        f.write(buffer.getvalue())
+
+
 def _standard_export(profiles, total, platform_name, item_type="profiles"):
     """Shared post-scrape: summary, enrichment, CSV export."""
     if profiles:
@@ -527,11 +555,7 @@ def _standard_export(profiles, total, platform_name, item_type="profiles"):
         if Confirm.ask("[+] Export to CSV?", default=True):
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             filename = f"{platform_name}_export_{timestamp}.csv"
-            with open(filename, 'w', newline='', encoding='utf-8') as f:
-                if profiles:
-                    writer = csv.DictWriter(f, fieldnames=profiles[0].keys())
-                    writer.writeheader()
-                    writer.writerows(profiles)
+            _write_csv(filename, profiles)
             _export_result(filename, len(profiles), item_type)
     else:
         _no_results()
@@ -710,14 +734,7 @@ def scrape_linktree_interactive():
                         flat[f'social_{platform}'] = handle
                 export_profiles.append(flat)
 
-            with open(filename, 'w', newline='', encoding='utf-8') as f:
-                if export_profiles:
-                    all_keys = set()
-                    for p in export_profiles:
-                        all_keys.update(p.keys())
-                    writer = csv.DictWriter(f, fieldnames=sorted(all_keys))
-                    writer.writeheader()
-                    writer.writerows(export_profiles)
+            _write_csv(filename, export_profiles)
             _export_result(filename, len(profiles))
     else:
         _no_results()
@@ -858,11 +875,7 @@ def scrape_from_file():
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             export_filename = f"{platform_key}_export_{timestamp}.csv"
 
-            with open(export_filename, 'w', newline='', encoding='utf-8') as f:
-                if profiles:
-                    writer = csv.DictWriter(f, fieldnames=profiles[0].keys())
-                    writer.writeheader()
-                    writer.writerows(profiles)
+            _write_csv(export_filename, profiles)
 
             _success_summary(successful, len(usernames))
             _export_result(export_filename, successful)

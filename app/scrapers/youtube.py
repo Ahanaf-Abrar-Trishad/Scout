@@ -90,19 +90,29 @@ def _extract_channel_data(html: str, identifier: str) -> Optional[Dict]:
         except (UnicodeDecodeError, UnicodeEncodeError):
             results['description'] = desc_match.group(1)
 
-    sub_patterns = [
-        r'"subscriberCountText":\{"simpleText":"([\d.,]+[KMB]?) subscribers?"',
-        r'"subscriberCountText":\{"accessibility":\{"accessibilityData":\{"label":"([\d.,]+[KMB]?) subscribers?"',
-    ]
-    for pattern in sub_patterns:
-        match = re.search(pattern, html, re.IGNORECASE)
-        if match:
-            results['subscriber_count'] = _parse_count(match.group(1))
-            break
-
     handle_match = re.search(r'"canonicalChannelUrl":"https://www\.youtube\.com/@([^"]+)"', html)
     if handle_match:
         results['handle'] = handle_match.group(1)
+
+    # The page also lists featured/related channels with their own subscriber
+    # counts, so only accept counts tied to this channel: the page header's
+    # metadata row, or an "@handle • N subscribers" line for this handle.
+    header_match = re.search(
+        r'"metadataParts":\[\{"text":\{"content":"([\d.,]+[KMB]?) subscribers?"', html, re.IGNORECASE
+    )
+    own_handle = results.get('handle')
+    if not own_handle and not re.fullmatch(r'UC[a-zA-Z0-9_-]{22}', identifier):
+        own_handle = identifier.lstrip('@')
+
+    if header_match:
+        results['subscriber_count'] = _parse_count(header_match.group(1))
+    elif own_handle:
+        handle_line = re.search(
+            r'"content":"[^"@]*@' + re.escape(own_handle) + r'(?![\w.-])[^"\d]*([\d.,]+[KMB]?) subscribers?',
+            html, re.IGNORECASE
+        )
+        if handle_line:
+            results['subscriber_count'] = _parse_count(handle_line.group(1))
 
     channel_id_match = re.search(r'"channelId":"(UC[a-zA-Z0-9_-]{22})"', html)
     if channel_id_match:

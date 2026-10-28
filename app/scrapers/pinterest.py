@@ -67,113 +67,76 @@ def scrape_profile(username: str) -> Optional[Dict]:
 
 
 def _extract_profile_data(html: str, username: str) -> Optional[Dict]:
-    """Extract profile data from Pinterest HTML."""
+    """Extract profile data from Pinterest HTML.
 
-    results = {}
+    Only trusts a user record whose username matches. The page also embeds
+    pins, boards and other accounts, so page-wide regex matches can belong
+    to someone else.
+    """
+    user_data = None
 
-    pws_match = re.search(r'<script[^>]*id="__PWS_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
-    if pws_match:
+    for script_id in ('__PWS_INITIAL_PROPS__', '__PWS_DATA__'):
+        match = re.search(
+            rf'<script[^>]*id="{script_id}"[^>]*>(.*?)</script>', html, re.DOTALL
+        )
+        if not match:
+            continue
         try:
-            pws_data = json.loads(pws_match.group(1))
-            user_data = _find_user_in_pws(pws_data, username)
-            if user_data:
-                results.update(user_data)
+            data = json.loads(match.group(1))
         except json.JSONDecodeError:
-            pass
+            continue
+        user_data = _find_user_in_pws(data, username)
+        if user_data:
+            break
 
-    if 'full_name' not in results:
-        name_match = re.search(r'"full_name":"([^"]+)"', html)
-        if name_match:
-            results['full_name'] = _decode_unicode(name_match.group(1))
-
-    if 'follower_count' not in results:
-        followers_match = re.search(r'"follower_count":(\d+)', html)
-        if followers_match:
-            results['follower_count'] = int(followers_match.group(1))
-
-    if 'following_count' not in results:
-        following_match = re.search(r'"following_count":(\d+)', html)
-        if following_match:
-            results['following_count'] = int(following_match.group(1))
-
-    if 'bio' not in results:
-        bio_match = re.search(r'"about":"([^"]*)"', html)
-        if bio_match:
-            results['bio'] = _decode_unicode(bio_match.group(1))
-
-    if 'website' not in results:
-        website_match = re.search(r'"website_url":"([^"]+)"', html)
-        if website_match:
-            results['website'] = website_match.group(1).replace('\\/', '/')
-
-    pin_match = re.search(r'"pin_count":(\d+)', html)
-    if pin_match:
-        results['pin_count'] = int(pin_match.group(1))
-
-    board_match = re.search(r'"board_count":(\d+)', html)
-    if board_match:
-        results['board_count'] = int(board_match.group(1))
-
-    verified_match = re.search(r'"is_verified_merchant":true', html)
-    results['verified'] = bool(verified_match)
-
-    if 'full_name' not in results and 'follower_count' not in results:
+    if not user_data:
+        logger.error(f"Pinterest profile data not found for {username}")
         return None
 
-    bio = results.get('bio', '')
+    bio = user_data.get('about') or ''
 
     return {
         'username': username,
-        'full_name': results.get('full_name', ''),
+        'full_name': user_data.get('full_name') or '',
         'bio': bio,
         'email': _extract_email(bio),
-        'website': results.get('website', ''),
-        'follower_count': results.get('follower_count', 0),
-        'following_count': results.get('following_count', 0),
-        'pin_count': results.get('pin_count', 0),
-        'board_count': results.get('board_count', 0),
-        'verified': results.get('verified', False),
+        'website': user_data.get('website_url') or '',
+        'follower_count': user_data.get('follower_count') or 0,
+        'following_count': user_data.get('following_count') or 0,
+        'pin_count': user_data.get('pin_count') or 0,
+        'board_count': user_data.get('board_count') or 0,
+        'verified': bool(user_data.get('is_verified_merchant')),
         'platform': 'pinterest',
         'profile_url': f'https://pinterest.com/{username}/',
     }
 
 
-def _find_user_in_pws(data: dict, username: str, depth: int = 0) -> Optional[Dict]:
-    """Recursively search for user data in PWS JSON."""
-    if depth > 15:
-        return None
+def _find_user_in_pws(data, username: str) -> Optional[Dict]:
+    """Find the fullest user record for username in Pinterest page JSON.
 
-    if isinstance(data, dict):
-        if data.get('username', '').lower() == username.lower() and 'follower_count' in data:
-            return {
-                'full_name': data.get('full_name', ''),
-                'bio': data.get('about', ''),
-                'follower_count': data.get('follower_count', 0),
-                'following_count': data.get('following_count', 0),
-                'website': data.get('website_url', ''),
-                'pin_count': data.get('pin_count', 0),
-                'board_count': data.get('board_count', 0),
-            }
+    The same user appears many times (as board owner, collaborator, etc.)
+    with only a few fields; the full profile record has the most keys.
+    """
+    best = None
+    stack = [(data, 0)]
 
-        for value in data.values():
-            result = _find_user_in_pws(value, username, depth + 1)
-            if result:
-                return result
+    while stack:
+        node, depth = stack.pop()
+        if depth > 20:
+            continue
 
-    elif isinstance(data, list):
-        for item in data:
-            result = _find_user_in_pws(item, username, depth + 1)
-            if result:
-                return result
+        if isinstance(node, dict):
+            node_username = node.get('username')
+            if (isinstance(node_username, str)
+                    and node_username.lower() == username.lower()
+                    and 'follower_count' in node
+                    and (best is None or len(node) > len(best))):
+                best = node
+            stack.extend((v, depth + 1) for v in node.values())
+        elif isinstance(node, list):
+            stack.extend((v, depth + 1) for v in node)
 
-    return None
-
-
-def _decode_unicode(text: str) -> str:
-    try:
-        return text.encode('utf-8').decode('unicode_escape')
-    except (UnicodeDecodeError, UnicodeEncodeError):
-        return text
+    return best
 
 
 _extract_email = extract_email

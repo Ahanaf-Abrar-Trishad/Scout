@@ -26,3 +26,8 @@ exports/
 .claude/
 *.swp
 *.swo
+
+# Local run data (leads, emails, enrichment output)
+context/
+output/
+runs/
